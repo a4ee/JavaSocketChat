@@ -8,6 +8,7 @@ import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Set;
 
 public class ServerEventHandler {
@@ -25,43 +26,36 @@ public class ServerEventHandler {
 
     public void handleEvents() throws IOException {
         if (selector.select(100) > 0){
-            Set<SelectionKey> selectionKeySet = selector.selectedKeys();
-            Iterator<SelectionKey> iterator = selectionKeySet.iterator();
-
+            Set<SelectionKey> keys = selector.selectedKeys();
+            Iterator<SelectionKey> iterator = keys.iterator();
 
             while (iterator.hasNext()){
                 SelectionKey key = iterator.next();
                 iterator.remove();
 
                 if (key.isAcceptable()) {
-                    handleAccept(key);
+                    acceptClient(key);
                 } else if (key.isReadable()) {
-                    handleRead(key);
+                    readFromClient(key);
                 }
             }
         }
     }
 
-    private void handleAccept(SelectionKey key) throws IOException {
+    private void acceptClient(SelectionKey key) throws IOException {
         ServerSocketChannel serverChannel = (ServerSocketChannel) key.channel();
-        SocketChannel clientChannel =serverChannel.accept();
-        if (!clientManager.canAcceptNewClient(config.getMaxClient())){
-            rejectClient(clientChannel);
-            return;
-        }
+        SocketChannel clientChannel = serverChannel.accept();
+
         clientChannel.configureBlocking(false);
         clientChannel.register(selector, SelectionKey.OP_READ);
 
         clientManager.addClient(clientChannel);
+        clientManager.sendToClient(clientChannel, "OK:Подключено к серверу");
 
-        clientChannel.write(ByteBuffer.wrap("\n".getBytes(StandardCharsets.UTF_8)));
-
-        System.out.println("Новое подключение, всего клиентов: " + clientManager.getClientCount());
-
-
+        System.out.println("Новый клиент подключился. Всего: " + clientManager.getClientCount());
     }
 
-    private void handleRead(SelectionKey key) throws IOException {
+    private void readFromClient(SelectionKey key) throws IOException {
         SocketChannel clientChannel = (SocketChannel) key.channel();
         buffer.clear();
 
@@ -72,79 +66,111 @@ public class ServerEventHandler {
                 return;
             }
 
-
             buffer.flip();
-            String message = StandardCharsets.UTF_8.decode(buffer).toString().trim();
+            String line = StandardCharsets.UTF_8.decode(buffer).toString().trim();
 
-            if (message.isEmpty()) {
+            if (line.isEmpty()) {
                 return;
             }
 
-            processMessage(clientChannel, message);
+            handleMessage(clientChannel, line);
+
         } catch (IOException e) {
             disconnectClient(clientChannel);
         }
-
     }
 
-    private void processMessage(SocketChannel clientChannel, String message) throws IOException {
+    private void handleMessage(SocketChannel client, String line) throws IOException {
+        Message msg = Message.fromProtocol(line);
+        String cmd = msg.getCommand();
+        String data = msg.getData();
 
-        if (!clientManager.hasUsername(clientChannel)){
-            handleUsernameRegistration(clientChannel, message);
+        switch (cmd) {
+            case "USERNAME":
+                handleUsername(client, data);
+                break;
+
+            case "CREATE":
+                handleCreateRoom(client, data);
+                break;
+
+            case "JOIN":
+                handleJoinRoom(client, data);
+                break;
+
+            case "LIST":
+                handleListRooms(client);
+                break;
+
+            case "MSG":
+                handleChatMessage(client, data);
+                break;
+
+            default:
+                clientManager.sendToClient(client, "ERROR:Неизвестная команда");
+        }
+    }
+
+    private void handleUsername(SocketChannel client, String username) throws IOException {
+        clientManager.setUsername(client, username);
+        clientManager.sendToClient(client, "OK:Имя установлено - " + username);
+        System.out.println("Клиент установил имя: " + username);
+    }
+
+    private void handleCreateRoom(SocketChannel client, String roomName) throws IOException {
+        if (clientManager.createRoom(roomName)) {
+            clientManager.sendToClient(client, "OK:Комната создана - " + roomName);
+            System.out.println("Создана комната: " + roomName);
+        } else {
+            clientManager.sendToClient(client, "ERROR:Комната уже существует");
+        }
+    }
+
+    private void handleJoinRoom(SocketChannel client, String roomName) throws IOException {
+        String username = clientManager.getUsername(client);
+
+        if (clientManager.joinRoom(client, roomName)) {
+            clientManager.sendToClient(client, "JOINED:" + roomName);
+
+            String notification = "SYSTEM:" + username + " вошёл в комнату";
+            clientManager.sendToRoom(roomName, notification);
+
+            System.out.println(username + " вошёл в комнату: " + roomName);
+        } else {
+            clientManager.sendToClient(client, "ERROR:Не удалось войти в комнату");
+        }
+    }
+
+    private void handleListRooms(SocketChannel client) throws IOException {
+        List<String> rooms = clientManager.getRoomList();
+        String roomList = String.join(";", rooms);
+        clientManager.sendToClient(client, "ROOMS:" + roomList);
+    }
+
+    private void handleChatMessage(SocketChannel client, String message) throws IOException {
+        String username = clientManager.getUsername(client);
+        String room = clientManager.getCurrentRoom(client);
+
+        if (room == null) {
+            clientManager.sendToClient(client, "ERROR:Вы не в комнате");
             return;
         }
 
-        String username = clientManager.getUsername(clientChannel);
+        clientManager.sendToRoomWithColor(client, room, username, message);
+    }
 
-        if (message.equalsIgnoreCase("stop")){
-            disconnectClient(clientChannel);
-            return;
+    private void disconnectClient(SocketChannel client) throws IOException {
+        String username = clientManager.getUsername(client);
+        String room = clientManager.getCurrentRoom(client);
+
+        if (room != null && username != null) {
+            String notification = "SYSTEM:" + username + " покинул комнату";
+            clientManager.sendToRoom(room, notification);
         }
 
-        if (message.length() > 100){
-            sendErrorMessage(clientChannel, "Лимит по количеству символов 100");
-            return;
-        }
+        clientManager.removeClient(client);
+        client.close();
 
-        broadcastChatMessage(username, message);
-    }
-
-    private void broadcastChatMessage(String username, String message) throws IOException {
-        String formMessage = "[" + username + "]: " + message;
-        clientManager.broadcastMessage(formMessage);
-    }
-
-    private void sendErrorMessage(SocketChannel clientChannel, String errorMessage) throws IOException {
-        clientChannel.write(ByteBuffer.wrap((errorMessage + "\n").getBytes(StandardCharsets.UTF_8)));
-    }
-
-    private void handleUsernameRegistration(SocketChannel clientChannel, String username) throws IOException {
-        clientManager.setUsername(clientChannel, username);
-        String welcomeMessage = "SERVER: Добро пожаловать в чат, " + clientManager.getUsername(clientChannel) + "!\n";
-        clientChannel.write(ByteBuffer.wrap(welcomeMessage.getBytes(StandardCharsets.UTF_8)));
-
-        clientManager.broadcastMessage("SERVER: " + clientManager.getUsername(clientChannel) + " присоединился к чату");
-        System.out.println("Клиент зарегистрирован как: " + clientManager.getUsername(clientChannel));
-    }
-
-    private void disconnectClient(SocketChannel clientChannel) throws IOException {
-        String username = clientManager.getUsername(clientChannel);
-
-        clientManager.removeClient(clientChannel);
-
-        if (clientChannel.isOpen()) {
-            clientChannel.close();
-        }
-
-        clientManager.broadcastMessage("SERVER: " + username + " покинул чат");
-        System.out.println("Клиент " + username + " отключен. Осталось клиентов: " + clientManager.getClientCount());
-    }
-
-
-    private void rejectClient(SocketChannel clientChannel) throws IOException {
-        String message = "Достигнут лимит участников в " + config.getMaxClient() + " ,пожалуйста попробуйте позже";
-        clientChannel.write(ByteBuffer.wrap(message.getBytes(StandardCharsets.UTF_8)));
-        clientChannel.close();
-        System.out.println("Отклонено подключение - достигнут лимит клиентов");
+        System.out.println("Клиент отключился: " + username + ". Осталось: " + clientManager.getClientCount());
     }
 }

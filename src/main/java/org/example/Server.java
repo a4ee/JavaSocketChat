@@ -29,7 +29,6 @@ public class Server {
                 Server chatServer = new Server(port, 10);
                 chatServer.startServer();
                 break;
-
             } catch (BindException e){
                 System.out.println("Порт " + port + " занят, попробуйте ввести другой." );
             }
